@@ -1,0 +1,13 @@
+listen_addr: ":443"
+listen_addr_http: ":80"
+
+enable_socks5: true
+socks_addr: 127.0.0.1:1080
+#socks_username: admin
+#socks_password: abc123
+
+allow_all_hosts: true
+
+#rules:
+#  - example.com
+#  - b.example2.com
