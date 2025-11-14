@@ -1,6 +1,6 @@
 module github.com/XIU2/SNIProxy
 
-go 1.18
+go 1.24.5
 
 require (
 	golang.org/x/net v0.0.0-20220812174116-3211cb980234

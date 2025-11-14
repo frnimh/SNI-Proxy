@@ -4,10 +4,10 @@ RUN apk add --no-cache git gcc musl-dev ca-certificates
 
 WORKDIR /app
 
-COPY go.mod go.sum /app/
+COPY src/go.mod src/go.sum /app/
 RUN go mod download
 
-COPY . /app/
+COPY src/ /app/
 RUN go build -o /app/sniproxy -ldflags="-s -w -X main.version=${VERSION}" .
 
 
