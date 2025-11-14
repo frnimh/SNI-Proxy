@@ -529,4 +529,4 @@ go build -o Releases/sniproxy_windows_386/sniproxy.exe -ldflags "-s -w -X main.v
 
 ## License
 
-The GPL-3.0 License.
+The MIT License.
