@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -93,39 +92,6 @@ func main() {
 	serviceLogger(fmt.Sprintf("Upstream proxy: %v", cfg.EnableSocks), 32, false)
 	serviceLogger(fmt.Sprintf("Domain names: %v", cfg.AllowAllHosts), 32, false)
 
-    startSniProxy() // Start SNI Proxy
-}
-
-// Start SNI Proxy
-func startSniProxy() {
-    _, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    // If listen_addr_http is configured, start an HTTP listener (for 301 redirect to HTTPS)
-    if cfg.ListenAddrHTTP != "" {
-        listenerHTTP, err := net.Listen("tcp", cfg.ListenAddrHTTP)
-        if err != nil {
-            serviceLogger(fmt.Sprintf("Failed to listen (HTTP) on %s: %v", cfg.ListenAddrHTTP, err), 31, false)
-            os.Exit(1)
-        }
-        serviceLogger(fmt.Sprintf("Listening on: %v", listenerHTTP.Addr()), 0, false)
-
-        go func(listenerHTTP net.Listener) {
-            defer listenerHTTP.Close()
-            for {
-                conn, err := listenerHTTP.Accept()
-                if err != nil {
-                    serviceLogger(fmt.Sprintf("Error while accepting (HTTP) connection: %v", err), 31, false)
-                    continue
-                }
-                raddr := conn.RemoteAddr().(*net.TCPAddr)
-                serviceLogger("Connection from: "+raddr.String(), 32, false)
-                go handleHTTPRedirect(conn) // New connection; handle in a new goroutine
-            }
-        }(listenerHTTP)
-    }
-
-    // Start HTTPS listener
     listener, err := net.Listen("tcp", cfg.ListenAddr)
     if err != nil {
             serviceLogger(fmt.Sprintf("Failed to listen (HTTPS) on %s: %v", cfg.ListenAddrHTTP, err), 31, false)
@@ -151,134 +117,7 @@ func startSniProxy() {
     ch := make(chan os.Signal, 2)
     signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
     s := <-ch
-    cancel()
     fmt.Printf("\nSignal received %s, Exit.\n", s)
-}
-
-// Handle HTTP redirect to HTTPS
-func handleHTTPRedirect(conn net.Conn) {
-    defer conn.Close()
-    buf := make([]byte, 1024)
-    n, err := conn.Read(buf)
-    if err != nil || n == 0 {
-        serviceLogger(fmt.Sprintf("Error reading (HTTP) connection request: %v", err), 31, false)
-        return
-    }
-    data := string(buf[:n])
-    lines := strings.Split(data, "\r\n")
-    if len(lines) == 0 {
-        serviceLogger("Not an HTTP/1.1 message", 31, true)
-        return
-    }
-    // Parse request line to get path
-    reqLine := strings.Fields(lines[0])
-    if len(reqLine) < 2 {
-        serviceLogger("Failed to parse HTTP/1.1 request", 31, true)
-        return
-    }
-    path := reqLine[1]
-    // Parse Host to get domain
-    var host string
-    for _, line := range lines[1:] {
-        if strings.HasPrefix(strings.ToLower(line), "host:") {
-            host = strings.TrimSpace(line[5:])
-            break
-        }
-    }
-    // If Host is missing or empty, do not redirect; just close
-    if host == "" {
-        serviceLogger("Domain not found (HTTP), ignoring...", 31, true)
-        return
-    }
-
-    if cfg.AllowAllHosts { // If allow_all_hosts is true, no need to check HTTP domain
-        sendHTTPRedirect(conn, host, path)
-        return
-    }
-    for _, rule := range cfg.ForwardRules { // Iterate over whitelisted domains in Rules
-        if strings.Contains(host, rule) { // If HTTP host contains a whitelisted domain (e.g., www.aa.com contains aa.com), redirect to HTTPS
-            sendHTTPRedirect(conn, host, path)
-            return
-        } else {
-            serviceLogger(fmt.Sprintf("Domain %s not in allowed domain list, ignoring (HTTP)...", host), 31, false)
-        }
-    }
-}
-
-// Send a 301 redirect response
-func sendHTTPRedirect(conn net.Conn, host, path string) {
-    // Build 301 redirect response
-    location := "https://" + host + path
-    resp := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", location)
-    serviceLogger(fmt.Sprintf("Redirect to: %s", location), 34, false)
-    // Send response
-    _, err := conn.Write([]byte(resp))
-    if err != nil {
-        serviceLogger(fmt.Sprintf("Unable to forward to backend (HTTP): %v", err), 31, false)
-    }
-}
-
-// Handle new HTTPS connection
-func serve(conn net.Conn, raddr string) {
-	defer conn.Close()
-
-	buf := make([]byte, 2048)
-	var fullHeader []byte
-	const maxAttempts = 2
-	attempts := 0
-
-	for {
-		n, err := conn.Read(buf)
-        if err != nil && err != io.EOF {
-            serviceLogger(fmt.Sprintf("Error reading (HTTPS) connection request: %v", err), 31, false)
-            return
-        }
-		fullHeader = append(fullHeader, buf[:n]...)
-
-        if len(fullHeader) < 5 { // Determine whether it's a TLS handshake message
-            serviceLogger("Not a TLS handshake message", 31, true)
-            return
-        } else if IsCompleteHandshake(fullHeader) { // Check if a complete TLS handshake message has been received
-            break // If complete, break the loop
-        }
-
-		attempts++
-        if attempts >= maxAttempts {
-            serviceLogger("Handshake message receive timeout.", 31, false)
-            return // Exceeded maximum wait attempts; exit
-        }
-    }
-    if attempts > 0 { // If > 0, handshake was fragmented or lost and required retries
-        serviceLogger("Complete handshake message received.", 32, true)
-    }
-
-    ServerName := getSNIServerName(fullHeader) // Extract SNI server name
-
-	if ServerName == "" {
-		serviceLogger("SNI domain not found (HTTPS), ignoring...", 31, true)
-		return
-	}
-
-    if cfg.AllowAllHosts { // If allow_all_hosts is true, skip SNI domain checks
-        serviceLogger(fmt.Sprintf("Forwarding target: %s:%d", ServerName, ForwardPort), 32, false)
-        forward(conn, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
-        return
-    }
-
-    for _, rule := range cfg.ForwardRules { // Iterate over whitelisted domains in Rules
-        if strings.Contains(ServerName, rule) { // If SNI contains a whitelisted domain (e.g., www.aa.com contains aa.com), forward connection
-            serviceLogger(fmt.Sprintf("Forwarding target: %s:%d", ServerName, ForwardPort), 32, false)
-            forward(conn, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
-        } else {
-            serviceLogger(fmt.Sprintf("Domain %s not in allowed domain list, ignoring (HTTPS)...", ServerName), 31, false)
-        }
-    }
-}
-
-// Determine whether the handshake message is complete
-func IsCompleteHandshake(header []byte) bool {
-    Length := binary.BigEndian.Uint16(header[3:5])
-    return len(header) >= int(Length)+5
 }
 
 // Extract SNI domain
@@ -320,32 +159,6 @@ func getSNIServerName(buf []byte) string {
         return ""
     }
     return msg.serverName
-}
-
-// forward forwards initial data to dst and then pipes traffic between client and backend.
-// It dials dst using GetDialer, writes data to backend, and connects streams via ioReflector.
-func forward(conn net.Conn, data []byte, dst string, raddr string) {
-    backend, err := GetDialer(cfg.EnableSocks).Dial("tcp", dst)
-    if err != nil {
-        serviceLogger(fmt.Sprintf("Unable to connect to backend (HTTPS): %v", err), 31, false)
-        return
-    }
-
-	defer backend.Close()
-
-    if _, err = backend.Write(data); err != nil {
-        serviceLogger(fmt.Sprintf("Unable to forward to backend (HTTPS): %v", err), 31, false)
-        return
-    }
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    conChk := make(chan struct{})
-    go ioReflector(ctx, backend, conn, false, conChk, raddr, dst)
-    go ioReflector(ctx, conn, backend, true, conChk, raddr, dst)
-    <-conChk
-    // Cancel context to notify the other ioReflector to exit
-	cancel()
 }
 
 // ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、一个 chan struct{} 类型的 conChk，以及两个字符串类型的 raddr 和 dsts
